@@ -56,6 +56,15 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 
+# Import APEX if available to use APEX FUSED ADAM 
+try:
+    import apex
+except ImportError as e:
+    HAS_APEX = False
+else:
+    HAS_APEX = True
+
+
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.32.0.dev0")
 
@@ -148,6 +157,11 @@ def parse_args():
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
+        "--gradient_checkpoint_enable",
+        action="store_true",
+        help="Enable Gradient Checkpoint, this allows to save memory, but forces model not to use cache so performance becomes bit slower.",
+    )
+    parser.add_argument(
         "--lr_scheduler_type",
         type=SchedulerType,
         default="linear",
@@ -165,6 +179,12 @@ def parse_args():
         default=None,
         help="Model type to use if training from scratch.",
         choices=MODEL_TYPES,
+    )
+    parser.add_argument(
+        "--model_config",
+        type=str,
+        default=None,
+        help="Model configuration to be updated when training from scratch, f.e: 'n_embd=1024,n_head=16,n_layer=24'",
     )
     parser.add_argument(
         "--block_size",
@@ -228,6 +248,18 @@ def parse_args():
             "If passed, LLM loading time and RAM consumption will be benefited."
         ),
     )
+    parser.add_argument(
+        "--tf32",
+        action="store_true",
+        help="Enable use Cuda TF32, improves memory usage and performance.",
+    )
+
+    parser.add_argument(
+        "--model_cuda",
+        action="store_true",
+        help="Enable set model to Cuda, improves memory usage and performance.",
+    )
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -384,11 +416,38 @@ def main():
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
-            low_cpu_mem_usage=args.low_cpu_mem_usage,
+            low_cpu_mem_usage=args.low_cpu_mem_usage
         )
+        
+        if args.model_cuda:
+            model.to('cuda')
+        
+        if args.gradient_checkpoint_enable:
+            model.gradient_checkpointing_enable()
+        
+        print(model.config)
+
     else:
         logger.info("Training new model from scratch")
+        
+        if args.model_config is not None:
+            config.update_from_string(args.model_config)
+
         model = AutoModelForCausalLM.from_config(config)
+        
+        if args.model_cuda:
+            model.to('cuda')
+       
+        if args.gradient_checkpoint_enable:
+            model.gradient_checkpointing_enable()
+
+        #TEST GPU: 4060 TI 16GB
+        #config.update_from_string('n_embd=1440,n_head=18,n_layer=32') #GPT2-CUSTOM-LARGE 4.08s/it (gradient_checkpointing_enable())
+        #config.update_from_string('n_embd=1344,n_head=24,n_layer=32') #GPT2-CUSTOM-XLARGE 4.27s/it (gradient_checkpointing_enable())
+        #config.update_from_string('n_embd=768,n_head=12,n_layer=12') #GPT2-BASE 1.26s/it (gradient_checkpointing_enable()) 1.63it/s (gradient_checkpointing_disable())
+        #config.update_from_string('n_embd=1024,n_head=16,n_layer=24') #GPT2-MEDIUM 2.09s/it (gradient_checkpointing_enable()) 1.56s/it (gradient_checkpointing_disable())
+
+        print(model.config)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -491,7 +550,15 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+
+    if HAS_APEX:
+        optimizer = apex.optimizers.FusedAdam(optimizer_grouped_parameters, lr=args.learning_rate)
+    else:    
+        optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=args.learning_rate, fused=True)
+
+    # Using CUDA TF32 to improve memory/throughput
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -580,7 +647,7 @@ def main():
     progress_bar.update(completed_steps)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
+        result = model.train()
         if args.with_tracking:
             total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
